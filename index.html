@@ -19,6 +19,8 @@
   button:hover, label.btn:hover { border-color:var(--accent); }
   button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
   input[type=file] { display:none; }
+  .slider { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); padding-left:4px; }
+  .slider input { width:90px; accent-color:var(--accent); }
   #viewport { position:fixed; inset:0; }
   #help { position:fixed; left:12px; bottom:12px; font-size:12px; color:var(--muted);
     background:rgba(27,32,39,.85); border:1px solid var(--border); border-radius:8px; padding:8px 10px; line-height:1.5; max-width:340px; }
@@ -45,12 +47,19 @@
     <button id="deleteBtn" title="Delete (Del)">Delete</button>
     <button id="resetView" title="Reset camera (F)">Reset view</button>
   </div>
+  <div class="group">
+    <button id="stereoBtn" title="Row-interleaved stereo (S)">Stereo 3D: Off</button>
+    <button id="swapBtn" title="Swap left/right eyes (X)">Swap eyes</button>
+    <span class="slider" title="Eye separation (stereo depth)">Depth
+      <input id="depth" type="range" min="0" max="0.6" step="0.01" value="0.15"></span>
+  </div>
 </div>
 
 <div id="help">
   <b>Camera:</b> left-drag = orbit · right-drag = pan · scroll / pinch = zoom<br>
   <b>Objects:</b> click to select, then drag the arrows/rings<br>
-  <b>Keys:</b> W move · E rotate · R scale · Del delete · F reset · Esc deselect
+  <b>Keys:</b> W move · E rotate · R scale · Del delete · F reset · Esc deselect<br>
+  <b>Stereo:</b> S toggle · X swap eyes (use if depth looks inside-out)
 </div>
 <div id="status"></div>
 
@@ -262,16 +271,102 @@ document.getElementById('fileInput').addEventListener('change', e => {
   e.target.value = '';
 });
 
-// ---------- Resize & render loop ----------
-window.addEventListener('resize', () => {
+// ---------- Row-interleaved stereo ----------
+// Each eye is rendered to its own offscreen image, then a shader picks
+// even screen rows from one eye and odd rows from the other.
+const stereoCam = new THREE.StereoCamera();
+let stereoOn = false;
+let swapEyes = false;
+
+const rtOpts = { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, samples: 4 };
+const rtL = new THREE.WebGLRenderTarget(1, 1, rtOpts);
+const rtR = new THREE.WebGLRenderTarget(1, 1, rtOpts);
+
+const interleaveMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tLeft: { value: rtL.texture },
+    tRight: { value: rtR.texture },
+    swap: { value: 0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tLeft;
+    uniform sampler2D tRight;
+    uniform float swap;
+    varying vec2 vUv;
+    void main() {
+      // gl_FragCoord.y is the physical pixel row (counted from the bottom)
+      float odd = mod(floor(gl_FragCoord.y), 2.0);
+      float useRight = abs(odd - swap);
+      gl_FragColor = useRight > 0.5 ? texture2D(tRight, vUv) : texture2D(tLeft, vUv);
+      #include <colorspace_fragment>
+    }`,
+  depthTest: false,
+  depthWrite: false,
+});
+const quadScene = new THREE.Scene();
+const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), interleaveMat));
+
+function updateSize() {
+  // Stereo needs 1 rendered row = 1 physical screen row, so use the full device pixel ratio
+  renderer.setPixelRatio(stereoOn ? window.devicePixelRatio : Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  rtL.setSize(size.x, size.y);
+  rtR.setSize(size.x, size.y);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+const stereoBtn = document.getElementById('stereoBtn');
+const swapBtn = document.getElementById('swapBtn');
+const depthSlider = document.getElementById('depth');
+
+function setStereo(on) {
+  stereoOn = on;
+  stereoBtn.textContent = 'Stereo 3D: ' + (on ? 'On' : 'Off');
+  stereoBtn.classList.toggle('active', on);
+  updateSize();
+}
+function toggleSwap() {
+  swapEyes = !swapEyes;
+  interleaveMat.uniforms.swap.value = swapEyes ? 1 : 0;
+  swapBtn.classList.toggle('active', swapEyes);
+}
+stereoBtn.onclick = () => setStereo(!stereoOn);
+swapBtn.onclick = toggleSwap;
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 's') setStereo(!stereoOn);
+  else if (k === 'x') toggleSwap();
 });
+
+// ---------- Resize & render loop ----------
+window.addEventListener('resize', updateSize);
+updateSize();
 
 renderer.setAnimationLoop(() => {
   orbit.update();
-  renderer.render(scene, camera);
+  if (!stereoOn) {
+    renderer.render(scene, camera);
+    return;
+  }
+  // Converge the eyes on the point the camera orbits around (comfortable viewing)
+  camera.focus = camera.position.distanceTo(orbit.target);
+  stereoCam.eyeSep = parseFloat(depthSlider.value);
+  camera.updateMatrixWorld();
+  stereoCam.update(camera);
+
+  renderer.setRenderTarget(rtL);
+  renderer.render(scene, stereoCam.cameraL);
+  renderer.setRenderTarget(rtR);
+  renderer.render(scene, stereoCam.cameraR);
+  renderer.setRenderTarget(null);
+  renderer.render(quadScene, quadCam);
 });
 </script>
 </body>
