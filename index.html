@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Viewer</title>
+<style>
+  :root { --bg:#111418; --panel:#1b2027; --text:#e6e9ee; --muted:#8a94a3; --accent:#4da3ff; --border:#2c333d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; }
+  #toolbar { position:fixed; top:0; left:0; right:0; display:flex; flex-wrap:wrap; gap:6px;
+    align-items:center; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border); z-index:10; }
+  #toolbar h1 { font-size:15px; margin:0 10px 0 0; font-weight:600; }
+  .group { display:flex; gap:4px; padding-right:8px; margin-right:4px; border-right:1px solid var(--border); }
+  .group:last-child { border-right:none; }
+  button, label.btn { background:#262d36; color:var(--text); border:1px solid var(--border); border-radius:6px;
+    padding:6px 10px; font-size:13px; cursor:pointer; user-select:none; }
+  button:hover, label.btn:hover { border-color:var(--accent); }
+  button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  input[type=file] { display:none; }
+  #viewport { position:fixed; inset:0; }
+  #help { position:fixed; left:12px; bottom:12px; font-size:12px; color:var(--muted);
+    background:rgba(27,32,39,.85); border:1px solid var(--border); border-radius:8px; padding:8px 10px; line-height:1.5; max-width:340px; }
+  #status { position:fixed; right:12px; bottom:12px; font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div id="viewport"></div>
+
+<div id="toolbar">
+  <h1>3D Viewer</h1>
+  <div class="group">
+    <button data-mode="translate" class="active" title="Move (W)">Move</button>
+    <button data-mode="rotate" title="Rotate (E)">Rotate</button>
+    <button data-mode="scale" title="Scale (R)">Scale</button>
+  </div>
+  <div class="group">
+    <button id="addCube">+ Cube</button>
+    <button id="addSphere">+ Sphere</button>
+    <button id="addTorus">+ Torus</button>
+    <label class="btn">Load model…<input id="fileInput" type="file" accept=".glb,.gltf,.obj,.stl"></label>
+  </div>
+  <div class="group">
+    <button id="deleteBtn" title="Delete (Del)">Delete</button>
+    <button id="resetView" title="Reset camera (F)">Reset view</button>
+  </div>
+</div>
+
+<div id="help">
+  <b>Camera:</b> left-drag = orbit · right-drag = pan · scroll / pinch = zoom<br>
+  <b>Objects:</b> click to select, then drag the arrows/rings<br>
+  <b>Keys:</b> W move · E rotate · R scale · Del delete · F reset · Esc deselect
+</div>
+<div id="status"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+const container = document.getElementById('viewport');
+const statusEl = document.getElementById('status');
+
+// ---------- Renderer, scene, camera ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111418);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 1000);
+const HOME = new THREE.Vector3(6, 5, 8);
+camera.position.copy(HOME);
+
+// ---------- Lights & ground ----------
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(5, 10, 7);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -15, right: 15, top: 15, bottom: -15 });
+scene.add(sun);
+
+const grid = new THREE.GridHelper(30, 30, 0x3a4350, 0x252b33);
+scene.add(grid);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), new THREE.ShadowMaterial({ opacity: 0.25 }));
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ---------- Controls ----------
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.target.set(0, 0.5, 0);
+
+const transform = new TransformControls(camera, renderer.domElement);
+transform.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; });
+scene.add(transform);
+
+// ---------- Objects ----------
+const objects = [];
+let selected = null;
+
+function addObject(obj, name) {
+  obj.name = name;
+  obj.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+  scene.add(obj);
+  objects.push(obj);
+  select(obj);
+  return obj;
+}
+
+function randomColor() { return new THREE.Color().setHSL(Math.random(), 0.6, 0.55); }
+function spawnPos() { return new THREE.Vector3((Math.random() - 0.5) * 6, 0, (Math.random() - 0.5) * 6); }
+
+function addPrimitive(kind) {
+  let geo, y;
+  if (kind === 'cube')   { geo = new THREE.BoxGeometry(1.2, 1.2, 1.2); y = 0.6; }
+  if (kind === 'sphere') { geo = new THREE.SphereGeometry(0.7, 48, 32); y = 0.7; }
+  if (kind === 'torus')  { geo = new THREE.TorusKnotGeometry(0.5, 0.18, 160, 24); y = 0.9; }
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: randomColor(), roughness: 0.4, metalness: 0.1 }));
+  mesh.position.copy(spawnPos()).setY(y);
+  addObject(mesh, kind);
+}
+
+function select(obj) {
+  selected = obj;
+  if (obj) transform.attach(obj); else transform.detach();
+  statusEl.textContent = obj ? `Selected: ${obj.name}` : '';
+}
+
+function deleteSelected() {
+  if (!selected) return;
+  const obj = selected;
+  select(null);
+  scene.remove(obj);
+  objects.splice(objects.indexOf(obj), 1);
+  obj.traverse(c => {
+    if (c.geometry) c.geometry.dispose();
+    if (c.material) [].concat(c.material).forEach(m => m.dispose());
+  });
+}
+
+// Starter scene
+addPrimitive('cube');  objects[0].position.set(-2, 0.6, 0);
+addPrimitive('sphere'); objects[1].position.set(0, 0.7, 0);
+addPrimitive('torus');  objects[2].position.set(2, 0.9, 0);
+select(null);
+
+// ---------- Click to select (ignores drags) ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let downPos = null;
+
+renderer.domElement.addEventListener('pointerdown', e => { downPos = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downPos || transform.dragging) return;
+  const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+  downPos = null;
+  if (moved > 4) return; // it was an orbit drag, not a click
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects(objects, true);
+  if (hits.length) {
+    let o = hits[0].object;
+    while (o && !objects.includes(o)) o = o.parent; // climb to the top-level object
+    select(o);
+  } else {
+    select(null);
+  }
+});
+
+// ---------- Toolbar ----------
+const modeButtons = document.querySelectorAll('[data-mode]');
+function setMode(mode) {
+  transform.setMode(mode);
+  modeButtons.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+}
+modeButtons.forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
+
+document.getElementById('addCube').onclick = () => addPrimitive('cube');
+document.getElementById('addSphere').onclick = () => addPrimitive('sphere');
+document.getElementById('addTorus').onclick = () => addPrimitive('torus');
+document.getElementById('deleteBtn').onclick = deleteSelected;
+document.getElementById('resetView').onclick = resetView;
+
+function resetView() {
+  camera.position.copy(HOME);
+  orbit.target.set(0, 0.5, 0);
+  orbit.update();
+}
+
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'w') setMode('translate');
+  else if (k === 'e') setMode('rotate');
+  else if (k === 'r') setMode('scale');
+  else if (k === 'delete' || k === 'backspace') deleteSelected();
+  else if (k === 'f') resetView();
+  else if (k === 'escape') select(null);
+});
+
+// ---------- Load your own models (.glb / .gltf / .obj / .stl) ----------
+function normalize(obj) {
+  // Scale model to ~2.5 units tall/wide and sit it on the ground
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const s = 2.5 / Math.max(size.x, size.y, size.z || 1);
+  const wrapper = new THREE.Group();
+  obj.scale.multiplyScalar(s);
+  const box2 = new THREE.Box3().setFromObject(obj);
+  const center = box2.getCenter(new THREE.Vector3());
+  obj.position.sub(new THREE.Vector3(center.x, box2.min.y, center.z));
+  wrapper.add(obj);
+  return wrapper;
+}
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  const ext = file.name.split('.').pop().toLowerCase();
+  const done = obj => {
+    const g = normalize(obj);
+    g.position.copy(spawnPos());
+    addObject(g, file.name);
+    URL.revokeObjectURL(url);
+  };
+  const fail = err => { statusEl.textContent = 'Could not load ' + file.name; console.error(err); };
+  statusEl.textContent = 'Loading ' + file.name + '…';
+
+  if (ext === 'glb' || ext === 'gltf') {
+    new GLTFLoader().load(url, g => done(g.scene), undefined, fail);
+  } else if (ext === 'obj') {
+    new OBJLoader().load(url, o => {
+      o.traverse(c => { if (c.isMesh) c.material = new THREE.MeshStandardMaterial({ color: randomColor(), roughness: 0.5 }); });
+      done(o);
+    }, undefined, fail);
+  } else if (ext === 'stl') {
+    new STLLoader().load(url, geo => {
+      geo.computeVertexNormals();
+      done(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: randomColor(), roughness: 0.5 })));
+    }, undefined, fail);
+  }
+  e.target.value = '';
+});
+
+// ---------- Resize & render loop ----------
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+renderer.setAnimationLoop(() => {
+  orbit.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
