@@ -24,6 +24,15 @@
   #viewport { position:fixed; inset:0; }
   #help { position:fixed; left:12px; bottom:12px; font-size:12px; color:var(--muted);
     background:rgba(27,32,39,.85); border:1px solid var(--border); border-radius:8px; padding:8px 10px; line-height:1.5; max-width:340px; }
+  input[type=number] { background:#262d36; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px; font-size:13px; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #trackPanel { position:fixed; right:12px; bottom:34px; width:168px; display:none; background:rgba(27,32,39,.9);
+    border:1px solid var(--border); border-radius:8px; padding:4px; z-index:5; }
+  #trackPanel.show { display:block; }
+  #trackPanel video { width:100%; display:block; border-radius:5px; transform:scaleX(-1); background:#000; }
+  #trackStatus { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); padding:4px 2px 2px; }
+  #trackDot { width:8px; height:8px; border-radius:50%; background:#666; flex:none; }
+  #trackDot.ok { background:#3ddc84; } #trackDot.wait { background:#f5b84a; } #trackDot.err { background:#ff5d5d; }
   #status { position:fixed; right:12px; bottom:12px; font-size:12px; color:var(--muted); }
 </style>
 </head>
@@ -53,13 +62,27 @@
     <span class="slider" title="Eye separation (stereo depth)">Depth
       <input id="depth" type="range" min="0" max="0.6" step="0.01" value="0.15"></span>
   </div>
+  <div class="group">
+    <button id="trackBtn" title="Webcam head tracking (T)">Head tracking: Off</button>
+    <button id="recenterBtn" title="Make your current head position the neutral view (C)">Recenter</button>
+    <span class="slider" title="Physical width of your screen's visible area">Screen
+      <input id="screenW" type="number" min="10" max="400" step="0.5" value="53" style="width:58px"> cm</span>
+    <span class="slider" title="Parallax strength (1 = physically correct)">Strength
+      <input id="strength" type="range" min="0" max="2.5" step="0.05" value="1"></span>
+  </div>
+</div>
+
+<div id="trackPanel">
+  <video id="cam" playsinline muted></video>
+  <div id="trackStatus"><span id="trackDot"></span><span id="trackText">Off</span></div>
 </div>
 
 <div id="help">
   <b>Camera:</b> left-drag = orbit · right-drag = pan · scroll / pinch = zoom<br>
   <b>Objects:</b> click to select, then drag the arrows/rings<br>
   <b>Keys:</b> W move · E rotate · R scale · Del delete · F reset · Esc deselect<br>
-  <b>Stereo:</b> S toggle · X swap eyes (use if depth looks inside-out)
+  <b>Stereo:</b> S toggle · X swap eyes (use if depth looks inside-out)<br>
+  <b>Head tracking:</b> T toggle · C recenter
 </div>
 <div id="status"></div>
 
@@ -184,7 +207,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
+  raycaster.setFromCamera(pointer, transform.camera); // head-tracked camera when active
   const hits = raycaster.intersectObjects(objects, true);
   if (hits.length) {
     let o = hits[0].object;
@@ -345,28 +368,209 @@ window.addEventListener('keydown', e => {
   else if (k === 'x') toggleSwap();
 });
 
+// ---------- Head tracking: fish-tank VR ----------
+// The webcam finds your eyes (MediaPipe Face Landmarker). Their spacing in the
+// image gives your distance, their position gives left/right/up/down. The screen
+// is treated as a fixed window into the scene: the camera moves to where your
+// eyes are and uses an off-axis (asymmetric) frustum through the screen edges.
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const IPD_CM = 6.3;                      // average distance between pupils
+const WEBCAM_HFOV = THREE.MathUtils.degToRad(60); // typical laptop/USB webcam
+
+const track = {
+  on: false, landmarker: null, stream: null, lastVideoTime: -1,
+  haveNeutral: false, lastSeen: 0,
+  smooth: new THREE.Vector3(0, 0, 60),   // filtered head position (cm, relative to webcam)
+  neutral: new THREE.Vector3(0, 0, 60),  // head position that gives the normal view
+};
+const video = document.getElementById('cam');
+const trackBtn = document.getElementById('trackBtn');
+const trackPanel = document.getElementById('trackPanel');
+const trackDot = document.getElementById('trackDot');
+const trackText = document.getElementById('trackText');
+const screenWInput = document.getElementById('screenW');
+const strengthSlider = document.getElementById('strength');
+
+try { const s = localStorage.getItem('screenWidthCm'); if (s) screenWInput.value = s; } catch (e) {}
+screenWInput.addEventListener('change', () => { try { localStorage.setItem('screenWidthCm', screenWInput.value); } catch (e) {} });
+
+function setTrackStatus(text, state) {
+  trackText.textContent = text;
+  trackDot.className = state || '';
+}
+
+async function createLandmarker() {
+  const { FaceLandmarker, FilesetResolver } = await import(MP + '/vision_bundle.mjs');
+  const fileset = await FilesetResolver.forVisionTasks(MP + '/wasm');
+  const opts = d => ({ baseOptions: { modelAssetPath: FACE_MODEL, delegate: d }, runningMode: 'VIDEO', numFaces: 1 });
+  try { return await FaceLandmarker.createFromOptions(fileset, opts('GPU')); }
+  catch (e) { return await FaceLandmarker.createFromOptions(fileset, opts('CPU')); }
+}
+
+async function startTracking() {
+  trackBtn.disabled = true;
+  trackPanel.classList.add('show');
+  try {
+    setTrackStatus('Starting webcam…', 'wait');
+    track.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' }, audio: false });
+    video.srcObject = track.stream;
+    await video.play();
+    if (!track.landmarker) {
+      setTrackStatus('Loading face tracker…', 'wait');
+      track.landmarker = await createLandmarker();
+    }
+    track.on = true;
+    track.haveNeutral = false;   // first face found becomes the neutral pose
+    track.lastVideoTime = -1;
+    setTrackStatus('Looking for face…', 'wait');
+    trackBtn.textContent = 'Head tracking: On';
+    trackBtn.classList.add('active');
+  } catch (err) {
+    console.error(err);
+    stopTracking();
+    trackPanel.classList.add('show');
+    setTrackStatus(err.name === 'NotAllowedError' ? 'Webcam permission denied' : 'Could not start: ' + (err.message || err), 'err');
+  } finally {
+    trackBtn.disabled = false;
+  }
+}
+
+function stopTracking() {
+  track.on = false;
+  if (track.stream) track.stream.getTracks().forEach(t => t.stop());
+  track.stream = null;
+  video.srcObject = null;
+  trackPanel.classList.remove('show');
+  trackBtn.textContent = 'Head tracking: Off';
+  trackBtn.classList.remove('active');
+}
+
+function recenter() {
+  if (track.on && track.haveNeutral) track.neutral.copy(track.smooth);
+}
+
+trackBtn.onclick = () => (track.on ? stopTracking() : startTracking());
+document.getElementById('recenterBtn').onclick = recenter;
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 't') trackBtn.click();
+  else if (k === 'c') recenter();
+});
+
+function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 }; }
+
+// Face landmarks -> head (eye-midpoint) position in cm relative to the webcam.
+// +x = your right, +y = up, z = distance from the screen.
+function headFromLandmarks(lm, vw, vh) {
+  const a = lm.length >= 478 ? lm[468] : mid(lm[33], lm[133]);   // iris centres if available
+  const b = lm.length >= 478 ? lm[473] : mid(lm[362], lm[263]);
+  const ipdPx = Math.hypot((a.x - b.x) * vw, (a.y - b.y) * vh, (a.z - b.z) * vw); // z term compensates head turn
+  const f = (vw / 2) / Math.tan(WEBCAM_HFOV / 2);
+  const z = IPD_CM * f / ipdPx;
+  const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+  return new THREE.Vector3((0.5 - cx) * vw * z / f, (0.5 - cy) * vh * z / f, z);
+}
+
+function pollFace() {
+  if (!track.landmarker || video.readyState < 2 || video.currentTime === track.lastVideoTime) return;
+  track.lastVideoTime = video.currentTime;
+  const now = performance.now();
+  const res = track.landmarker.detectForVideo(video, now);
+  const lm = res.faceLandmarks && res.faceLandmarks[0];
+  if (lm) {
+    const raw = headFromLandmarks(lm, video.videoWidth, video.videoHeight);
+    if (!track.haveNeutral) { track.neutral.copy(raw); track.smooth.copy(raw); track.haveNeutral = true; }
+    // Adaptive smoothing: heavy for small jitter, light for real movement
+    const a = THREE.MathUtils.clamp(track.smooth.distanceTo(raw) / 4, 0.12, 0.85);
+    track.smooth.lerp(raw, a);
+    track.lastSeen = now;
+    setTrackStatus(`Tracking · ${Math.round(track.smooth.z)} cm`, 'ok');
+  } else if (now - track.lastSeen > 1500) {
+    track.smooth.lerp(track.neutral, 0.06);   // face lost: drift back to the normal view
+    setTrackStatus('Looking for face…', 'wait');
+  }
+}
+
+// Physical size of the canvas in cm (the browser window may not fill the screen)
+function canvasSizeCm() {
+  const screenW = parseFloat(screenWInput.value) || 53;
+  const w = screenW * window.innerWidth / window.screen.width;
+  return { w, h: w * window.innerHeight / window.innerWidth };
+}
+
+const headCam = new THREE.PerspectiveCamera();
+const headCamL = new THREE.PerspectiveCamera();
+const headCamR = new THREE.PerspectiveCamera();
+
+// Place `cam` at `eye` (world units, in the screen's frame: origin = orbit target,
+// axes = the orbit camera's right / up / back) looking through a window of
+// size 2*halfW x 2*halfH centred on the orbit target.
+function setOffAxis(cam, eye, halfW, halfH) {
+  cam.quaternion.copy(camera.quaternion);
+  cam.position.copy(eye).applyQuaternion(camera.quaternion).add(orbit.target);
+  cam.fov = camera.fov;
+  cam.updateMatrixWorld(true);
+  const n = camera.near, s = n / eye.z;
+  cam.projectionMatrix.makePerspective(
+    (-halfW - eye.x) * s, (halfW - eye.x) * s,
+    (halfH - eye.y) * s, (-halfH - eye.y) * s, n, camera.far);
+  cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+}
+
 // ---------- Resize & render loop ----------
 window.addEventListener('resize', updateSize);
 updateSize();
 
+function renderStereo(camL, camR) {
+  renderer.setRenderTarget(rtL);
+  renderer.render(scene, camL);
+  renderer.setRenderTarget(rtR);
+  renderer.render(scene, camR);
+  renderer.setRenderTarget(null);
+  renderer.render(quadScene, quadCam);
+}
+
 renderer.setAnimationLoop(() => {
   orbit.update();
-  if (!stereoOn) {
-    renderer.render(scene, camera);
+  camera.updateMatrixWorld();
+  if (track.on) pollFace();
+  const useHead = track.on && track.haveNeutral;
+
+  // Picking and the move/rotate gizmo use whichever camera is drawing the view
+  transform.camera = useHead ? headCam : camera;
+
+  if (useHead) {
+    // The orbit target sits on the screen plane. Keep what you saw at that plane,
+    // and place your eyes at their real distance in front of it.
+    const D = camera.position.distanceTo(orbit.target);
+    const { w, h } = canvasSizeCm();
+    const k = 2 * D * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / h; // world units per cm
+    const st = parseFloat(strengthSlider.value);
+    const eye = new THREE.Vector3(
+      (track.smooth.x - track.neutral.x) * st,
+      (track.smooth.y - track.neutral.y) * st,
+      Math.max(15, track.neutral.z + (track.smooth.z - track.neutral.z) * st)
+    ).multiplyScalar(k);
+    const halfW = w * k / 2, halfH = h * k / 2;
+    setOffAxis(headCam, eye, halfW, halfH);
+
+    if (!stereoOn) { renderer.render(scene, headCam); return; }
+    // Real eye spacing; the Depth slider scales it (0.15 = natural)
+    const half = IPD_CM * k * (parseFloat(depthSlider.value) / 0.15) / 2;
+    setOffAxis(headCamL, eye.clone().setX(eye.x - half), halfW, halfH);
+    setOffAxis(headCamR, eye.clone().setX(eye.x + half), halfW, halfH);
+    renderStereo(headCamL, headCamR);
     return;
   }
+
+  if (!stereoOn) { renderer.render(scene, camera); return; }
   // Converge the eyes on the point the camera orbits around (comfortable viewing)
   camera.focus = camera.position.distanceTo(orbit.target);
   stereoCam.eyeSep = parseFloat(depthSlider.value);
-  camera.updateMatrixWorld();
   stereoCam.update(camera);
-
-  renderer.setRenderTarget(rtL);
-  renderer.render(scene, stereoCam.cameraL);
-  renderer.setRenderTarget(rtR);
-  renderer.render(scene, stereoCam.cameraR);
-  renderer.setRenderTarget(null);
-  renderer.render(quadScene, quadCam);
+  renderStereo(stereoCam.cameraL, stereoCam.cameraR);
 });
 </script>
 </body>
